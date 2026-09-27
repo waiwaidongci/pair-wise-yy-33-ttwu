@@ -1,1 +1,51 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}section{border:1px solid #e0b4b4;border-radius:8px;padding:12px 16px;margin:12px 0;background:#fff8f8}h2{font-size:20px}h3{font-size:16px;margin:8px 0}ul{margin:4px 0}table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #ccc;padding:4px 8px;font-size:14px;text-align:left}</style>
+<h1>电网事故应急与恢复调度</h1>
+<p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离、接地闭锁台账和状态发布。</p>
+<button onclick="loadState()">刷新状态</button>
+<h2>接地闭锁（按事故）</h2>
+<div id="incidents">加载中...</div>
+<h2>接地线台账</h2>
+<div id="tickets">加载中...</div>
+<h2>系统状态</h2>
+<pre id="state">加载中...</pre>
+<script>
+function el(tag,text){const e=document.createElement(tag);if(text!==undefined)e.textContent=text;return e}
+function listOf(target,items){const ul=el('ul');for(const t of items)ul.append(el('li',t));target.append(ul)}
+function renderIncidents(list){
+  const box=document.getElementById('incidents');box.innerHTML='';
+  if(!list.length){box.append(el('p','当前没有接地闭锁中的事故'));return}
+  for(const inc of list){
+    const sec=el('section');
+    sec.append(el('h3',`事故 ${inc.incident_code}（${inc.outage_state}）`));
+    sec.append(el('h3','闭锁线路'));
+    listOf(sec,inc.locked_lines.map(l=>`${l.asset_code} ${l.asset_name}：接地线 ${l.ground_wire_no}，${l.crew} 挂设于 ${l.hung_at}（现场单号 ${l.site_order_no}，登记人 ${l.installed_by}）`));
+    sec.append(el('h3','待办步骤'));
+    listOf(sec,inc.pending_steps.length?inc.pending_steps.map(p=>`步骤 ${p.step_no} ${p.action}（${p.asset}）：待处理报告 ${p.held_reports} 条，闭锁来源 ${p.locked_by.join('、')}`):['无']);
+    sec.append(el('h3','解除条件'));
+    listOf(sec,inc.release_conditions);
+    box.append(sec);
+  }
+}
+function renderTickets(list){
+  const box=document.getElementById('tickets');box.innerHTML='';
+  if(!list.length){box.append(el('p','暂无接地线登记'));return}
+  const t=el('table'),head=el('tr');
+  for(const h of ['现场单号','线路','接地线编号','班组','挂设时刻','登记人','状态','拆除核对'])head.append(el('th',h));
+  t.append(head);
+  for(const g of list){
+    const tr=el('tr');
+    for(const v of [g.site_order_no,`${g.asset_code} ${g.asset_name}`,g.ground_wire_no,g.crew,g.hung_at,g.installed_by,
+                    g.removed?'已拆除':'挂设中',
+                    g.removed?`${g.removed_by} 核对线号 ${g.removal_wire_no}，照片 ${g.removal_photo_ref}（${g.removed_at}）`:'—'])tr.append(el('td',v));
+    t.append(tr);
+  }
+  box.append(t);
+}
+async function loadState(){
+  const s=await (await fetch('/api/state')).json();
+  document.getElementById('state').textContent=JSON.stringify(s,null,2);
+  renderIncidents(s.grounding_overview||[]);
+  renderTickets(s.grounding_tickets||[]);
+}
+loadState()
+</script></html>
