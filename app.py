@@ -65,8 +65,16 @@ class Store:
         CREATE TABLE IF NOT EXISTS field_reports (
           id INTEGER PRIMARY KEY AUTOINCREMENT, client_report_id TEXT UNIQUE NOT NULL, plan_id INTEGER NOT NULL REFERENCES plans(id),
           step_no INTEGER NOT NULL, expected_plan_version INTEGER NOT NULL, status TEXT NOT NULL,
-          note TEXT, merge_status TEXT NOT NULL CHECK(merge_status IN ('merged','conflict','protected')),
+          note TEXT, merge_status TEXT NOT NULL CHECK(merge_status IN ('merged','conflict','protected','pending')),
           conflict_reason TEXT, reported_by TEXT NOT NULL, received_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS grounding_locks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, site_order_no TEXT UNIQUE NOT NULL,
+          outage_id INTEGER NOT NULL REFERENCES outages(id), asset_id INTEGER NOT NULL REFERENCES assets(id),
+          wire_no TEXT NOT NULL, hung_at TEXT NOT NULL, crew TEXT NOT NULL, note TEXT,
+          status TEXT NOT NULL CHECK(status IN ('active','removed')),
+          registered_by TEXT NOT NULL, registered_at TEXT NOT NULL,
+          removed_by TEXT, removed_at TEXT, removal_photo TEXT, removal_note TEXT
         );
         CREATE TABLE IF NOT EXISTS telemetry (
           id INTEGER PRIMARY KEY AUTOINCREMENT, asset_id INTEGER NOT NULL REFERENCES assets(id), load_mw REAL NOT NULL,
@@ -82,7 +90,23 @@ class Store:
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        self._migrate_field_reports()
         self.conn.commit()
+
+    def _migrate_field_reports(self) -> None:
+        row = self.conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='field_reports'").fetchone()
+        if not row or "'pending'" in row[0]: return
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        with self.conn:
+            self.conn.execute("ALTER TABLE field_reports RENAME TO field_reports_legacy")
+            self.conn.execute("""CREATE TABLE field_reports (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, client_report_id TEXT UNIQUE NOT NULL, plan_id INTEGER NOT NULL REFERENCES plans(id),
+              step_no INTEGER NOT NULL, expected_plan_version INTEGER NOT NULL, status TEXT NOT NULL,
+              note TEXT, merge_status TEXT NOT NULL CHECK(merge_status IN ('merged','conflict','protected','pending')),
+              conflict_reason TEXT, reported_by TEXT NOT NULL, received_at TEXT NOT NULL)""")
+            self.conn.execute("INSERT INTO field_reports SELECT * FROM field_reports_legacy")
+            self.conn.execute("DROP TABLE field_reports_legacy")
+        self.conn.execute("PRAGMA foreign_keys=ON")
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
         self.conn.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
@@ -224,6 +248,8 @@ class GridService:
         elif int(expected_plan_version) != int(plan["version"]): merge_status, conflict = "conflict", "现场报告基于旧计划版本"
         elif self.conn.execute("SELECT id FROM confirmations WHERE plan_id=? AND step_no=?", (plan_id, step_no)).fetchone():
             merge_status, conflict = "protected", "已确认记录不能由普通现场报告覆盖"
+        elif status == "completed" and self._step_locked(steps[step_no]["asset"]):
+            merge_status, conflict = "pending", "接地线未拆除，线路及下游资产闭锁，报告留待处理"
         with self.conn:
             cur = self.conn.execute("""INSERT INTO field_reports(client_report_id,plan_id,step_no,expected_plan_version,status,note,merge_status,conflict_reason,reported_by,received_at)
                                      VALUES(?,?,?,?,?,?,?,?,?,?)""", (client_report_id, plan_id, step_no, expected_plan_version, status, note, merge_status, conflict, actor, now()))
@@ -239,6 +265,8 @@ class GridService:
         if plan["state"] != "active": raise ApiError(409, "只有执行中的计划可以确认")
         steps = {int(x["seq"]): x for x in json.loads(plan["steps_json"])}
         if step_no not in steps: raise ApiError(400, "计划中没有该步骤")
+        if decision == "confirmed" and self._step_locked(steps[step_no]["asset"]):
+            raise ApiError(409, "接地线未拆除，该步骤处于闭锁状态，不能确认完成")
         report = self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? AND step_no=? AND merge_status='merged' ORDER BY id DESC LIMIT 1", (plan_id, step_no)).fetchone()
         if not report: raise ApiError(409, "没有可确认的现场报告")
         if decision == "confirmed" and report["status"] != "completed": raise ApiError(409, "现场步骤尚未完成")
@@ -259,15 +287,119 @@ class GridService:
         confirmations = {row["step_no"]: dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=?", (plan_id,))}
         steps = json.loads(plan["steps_json"])
         completed = sum(1 for step in steps if confirmations.get(int(step["seq"]), {}).get("status") == "confirmed")
+        active_locks = [dict(row) for row in self.conn.execute("SELECT * FROM grounding_locks WHERE outage_id=? AND status='active' ORDER BY id", (outage_id,))]
         status = {"outage_id": outage_id, "incident_code": outage["incident_code"], "plan_id": plan_id, "plan_version": plan["version"],
                   "state": "restored" if completed == len(steps) else "restoring", "completed_steps": completed, "total_steps": len(steps),
-                  "critical_blocked": [x for x in confirmations.values() if x["status"] == "blocked"]}
+                  "critical_blocked": [x for x in confirmations.values() if x["status"] == "blocked"],
+                  "grounding_locks_active": len(active_locks), "grounding_locks_outstanding": [row["wire_no"] for row in active_locks]}
+        if status["state"] == "restored" and active_locks:
+            raise ApiError(409, "事故尚有未拆除接地线：" + "、".join(row["wire_no"] for row in active_locks) + "，不得发布恢复完成")
         with self.conn:
             cur = self.conn.execute("INSERT INTO published_status(outage_id,plan_id,version,status_json,created_at) VALUES(?,?,?,?,?)",
                                     (outage_id, plan_id, plan["version"], j(status), now()))
             if status["state"] == "restored": self.conn.execute("UPDATE outages SET state='restored',revision=revision+1,updated_at=? WHERE id=?", (now(), outage_id))
             self.store.audit(actor, "status.publish", "outage", outage_id, {"plan_id": plan_id, "state": status["state"]})
         return {"id": cur.lastrowid, "status": status}
+
+    def register_grounding_lock(self, actor: str | None, role: str | None, outage_id: int, asset_id: int, wire_no: str, hung_at: str, crew: str, site_order_no: str, note: str = "") -> dict:
+        actor = self._actor(actor, role, {"dispatcher", "field"})
+        if not site_order_no.strip(): raise ApiError(400, "现场单号不能为空")
+        existing = self.conn.execute("SELECT * FROM grounding_locks WHERE site_order_no=?", (site_order_no,)).fetchone()
+        if existing: return self._lock_dict(existing)
+        self._row("outages", outage_id); self._row("assets", asset_id)
+        if not wire_no.strip() or not crew.strip(): raise ApiError(400, "接地线编号和班组不能为空")
+        hung_at = hung_at.strip() or now()
+        with self.conn:
+            cur = self.conn.execute("""INSERT INTO grounding_locks(site_order_no,outage_id,asset_id,wire_no,hung_at,crew,note,status,registered_by,registered_at)
+                                     VALUES(?,?,?,?,?,?,?,'active',?,?)""",
+                                    (site_order_no, outage_id, asset_id, wire_no.strip(), hung_at, crew.strip(), note, actor, now()))
+            self.store.audit(actor, "grounding.register", "grounding_lock", cur.lastrowid,
+                             {"site_order_no": site_order_no, "outage_id": outage_id, "asset_id": asset_id, "wire_no": wire_no, "hung_at": hung_at, "crew": crew})
+        return self._lock_dict(self._row("grounding_locks", cur.lastrowid))
+
+    def remove_grounding_lock(self, actor: str | None, role: str | None, lock_id: int, wire_no: str, photo: str, note: str = "") -> dict:
+        actor = self._actor(actor, role, {"dispatcher", "operator"})
+        lock = self._row("grounding_locks", lock_id)
+        if lock["status"] == "removed": raise ApiError(409, "接地线已拆除登记")
+        if actor == lock["registered_by"]: raise ApiError(409, "拆除须由另一名值班员核对登记")
+        if not photo.strip(): raise ApiError(400, "拆除登记必须附现场照片")
+        if wire_no.strip() != lock["wire_no"]: raise ApiError(409, "接地线编号与台账不符")
+        with self.conn:
+            self.conn.execute("UPDATE grounding_locks SET status='removed',removed_by=?,removed_at=?,removal_photo=?,removal_note=? WHERE id=?",
+                              (actor, now(), photo.strip(), note, lock_id))
+            promoted = self._promote_pending(actor, lock)
+            self.store.audit(actor, "grounding.remove", "grounding_lock", lock_id,
+                             {"wire_no": lock["wire_no"], "photo": photo, "promoted_reports": promoted})
+        result = self._lock_dict(self._row("grounding_locks", lock_id)); result["promoted_reports"] = promoted
+        return result
+
+    def _promote_pending(self, actor: str, lock: sqlite3.Row) -> list[int]:
+        locked = self._locked_asset_ids(); promoted = []
+        rows = self.conn.execute("""SELECT fr.id, fr.plan_id, fr.step_no, fr.expected_plan_version, p.version, p.state, p.steps_json
+                                  FROM field_reports fr JOIN plans p ON p.id=fr.plan_id
+                                  WHERE fr.merge_status='pending' AND p.outage_id=?""", (lock["outage_id"],)).fetchall()
+        for row in rows:
+            if row["state"] != "active" or int(row["expected_plan_version"]) != int(row["version"]): continue
+            step = {int(s["seq"]): s for s in json.loads(row["steps_json"])}.get(int(row["step_no"]))
+            if not step: continue
+            asset = self.conn.execute("SELECT id FROM assets WHERE code=?", (step["asset"],)).fetchone()
+            if asset and asset["id"] in locked: continue
+            self.conn.execute("UPDATE field_reports SET merge_status='merged',conflict_reason=NULL WHERE id=?", (row["id"],))
+            self.store.audit(actor, "field_report.promoted", "field_report", row["id"],
+                             {"plan_id": row["plan_id"], "step_no": row["step_no"], "grounding_lock": lock["id"]})
+            promoted.append(row["id"])
+        return promoted
+
+    def _descendant_ids(self, asset_id: int) -> set[int]:
+        rows = self.conn.execute("""WITH RECURSIVE sub(id) AS (SELECT id FROM assets WHERE id=?
+                                  UNION ALL SELECT a.id FROM assets a JOIN sub s ON a.parent_id=s.id) SELECT id FROM sub""", (asset_id,)).fetchall()
+        return {row["id"] for row in rows}
+
+    def _locked_asset_ids(self) -> set[int]:
+        locked: set[int] = set()
+        for row in self.conn.execute("SELECT asset_id FROM grounding_locks WHERE status='active'"):
+            locked |= self._descendant_ids(row["asset_id"])
+        return locked
+
+    def _step_locked(self, asset_code: str) -> bool:
+        row = self.conn.execute("SELECT id FROM assets WHERE code=?", (asset_code,)).fetchone()
+        return bool(row) and row["id"] in self._locked_asset_ids()
+
+    def _lock_dict(self, row: sqlite3.Row) -> dict:
+        asset = self.conn.execute("SELECT code,name FROM assets WHERE id=?", (row["asset_id"],)).fetchone()
+        return {"id": row["id"], "site_order_no": row["site_order_no"], "outage_id": row["outage_id"], "asset_id": row["asset_id"],
+                "asset_code": asset["code"] if asset else None, "asset_name": asset["name"] if asset else None,
+                "wire_no": row["wire_no"], "hung_at": row["hung_at"], "crew": row["crew"], "note": row["note"], "status": row["status"],
+                "registered_by": row["registered_by"], "registered_at": row["registered_at"],
+                "removed_by": row["removed_by"], "removed_at": row["removed_at"], "removal_photo": row["removal_photo"], "removal_note": row["removal_note"]}
+
+    def list_grounding_locks(self) -> list[dict]:
+        return [self._lock_dict(row) for row in self.conn.execute("SELECT * FROM grounding_locks ORDER BY id DESC")]
+
+    def grounding_view(self, outage_id: int) -> dict:
+        outage = self._row("outages", outage_id)
+        locks = [self._lock_dict(row) for row in self.conn.execute("SELECT * FROM grounding_locks WHERE outage_id=? ORDER BY id", (outage_id,))]
+        locked: dict[int, dict] = {}
+        for lock in locks:
+            if lock["status"] == "active":
+                for asset_id in self._descendant_ids(lock["asset_id"]): locked.setdefault(asset_id, lock)
+        locked_lines = []
+        for asset_id, lock in sorted(locked.items()):
+            asset = self.conn.execute("SELECT * FROM assets WHERE id=?", (asset_id,)).fetchone()
+            if asset: locked_lines.append({"asset_id": asset_id, "asset_code": asset["code"], "asset_name": asset["name"], "wire_no": lock["wire_no"], "lock_id": lock["id"]})
+        pending_steps = []
+        for row in self.conn.execute("""SELECT fr.id, fr.plan_id, fr.step_no, fr.client_report_id, fr.reported_by, fr.received_at, p.version, p.steps_json
+                                      FROM field_reports fr JOIN plans p ON p.id=fr.plan_id
+                                      WHERE fr.merge_status='pending' AND p.outage_id=? ORDER BY fr.id""", (outage_id,)):
+            step = {int(s["seq"]): s for s in json.loads(row["steps_json"])}.get(int(row["step_no"]), {})
+            pending_steps.append({"report_id": row["id"], "plan_id": row["plan_id"], "plan_version": row["version"], "step_no": row["step_no"],
+                                  "asset": step.get("asset"), "action": step.get("action"), "client_report_id": row["client_report_id"],
+                                  "reported_by": row["reported_by"], "received_at": row["received_at"]})
+        active = [lock for lock in locks if lock["status"] == "active"]
+        release_conditions = [f"接地线 {lock['wire_no']}（{lock['asset_code']}，班组 {lock['crew']}）：由另一名值班员核对线号与现场照片后登记拆除" for lock in active]
+        if active: release_conditions.append("全部接地线登记拆除后，事故方可发布恢复完成")
+        return {"outage_id": outage_id, "incident_code": outage["incident_code"], "state": outage["state"], "locks": locks,
+                "locked_lines": locked_lines, "pending_steps": pending_steps, "release_conditions": release_conditions, "publish_ready": not active}
 
     def _validate_steps(self, steps: list[dict]) -> list[dict]:
         if not steps: raise ApiError(400, "恢复计划至少需要一个步骤")
@@ -328,6 +460,8 @@ class GridService:
                 "outages": [self._outage_dict(row) for row in self.conn.execute("SELECT * FROM outages ORDER BY id DESC")],
                 "plans": [self._plan_dict(row) for row in self.conn.execute("SELECT * FROM plans ORDER BY id DESC")],
                 "telemetry_anomalies": [dict(row) for row in self.conn.execute("SELECT * FROM telemetry WHERE valid=0 ORDER BY id DESC LIMIT 20")],
+                "grounding_locks": self.list_grounding_locks(),
+                "grounding": [self.grounding_view(row["id"]) for row in self.conn.execute("SELECT id FROM outages ORDER BY id DESC")],
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
     def seed(self) -> None:
@@ -354,6 +488,8 @@ class Handler(BaseHTTPRequestHandler):
             p = self._parts()
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
+            elif p == ["api", "grounding-locks"]: out = {"grounding_locks": self.service.list_grounding_locks()}
+            elif len(p) == 4 and p[:2] == ["api", "outages"] and p[3] == "grounding": out = self.service.grounding_view(int(p[2]))
             elif len(p) == 3 and p[:2] == ["api", "plans"]: out = self.service.plan_detail(int(p[2]))
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
@@ -377,6 +513,8 @@ class Handler(BaseHTTPRequestHandler):
             elif p == ["api", "field-reports"]: out = self.service.field_report(actor, role, int(b.get("plan_id", 0)), int(b.get("step_no", 0)), b.get("client_report_id", ""), int(b.get("expected_plan_version", 0)), b.get("status", ""), b.get("note", ""))
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "confirm": out = self.service.confirm_step(actor, role, int(p[2]), int(b.get("step_no", 0)), b.get("decision", "confirmed"), b.get("note", ""))
             elif p == ["api", "status"]: out = self.service.publish_status(actor, role, int(b.get("outage_id", 0)), int(b.get("plan_id", 0)))
+            elif p == ["api", "grounding-locks"]: out = self.service.register_grounding_lock(actor, role, int(b.get("outage_id", 0)), int(b.get("asset_id", 0)), b.get("wire_no", ""), b.get("hung_at", ""), b.get("crew", ""), b.get("site_order_no", ""), b.get("note", ""))
+            elif len(p) == 4 and p[:2] == ["api", "grounding-locks"] and p[3] == "remove": out = self.service.remove_grounding_lock(actor, role, int(p[2]), b.get("wire_no", ""), b.get("photo", ""), b.get("note", ""))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})

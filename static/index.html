@@ -1,1 +1,25 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}.incident{border:1px solid #d0d7de;border-radius:8px;padding:12px 16px;margin:12px 0}.incident h3{margin:0 0 8px}.locked{color:#b42318}.ok{color:#067647}ul{margin:4px 0}</style>
+<h1>电网事故应急与恢复调度</h1>
+<p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离、接地闭锁台账和状态发布。</p>
+<button onclick="loadState()">刷新状态</button>
+<h2>接地闭锁台账（按事故）</h2>
+<div id="grounding">加载中...</div>
+<h2>原始状态</h2>
+<pre id="state">加载中...</pre>
+<script>
+const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+function renderIncident(g){
+  const lines=(g.locked_lines||[]).map(l=>`<li class=locked>${esc(l.asset_code)} ${esc(l.asset_name||'')}（接地线 ${esc(l.wire_no)}）</li>`).join('')||'<li class=ok>无</li>';
+  const pending=(g.pending_steps||[]).map(s=>`<li>计划#${s.plan_id} 步骤${s.step_no} ${esc(s.asset||'')} ${esc(s.action||'')}（报告 ${esc(s.client_report_id)}，${esc(s.reported_by)} 上报，留待处理）</li>`).join('')||'<li class=ok>无</li>';
+  const cond=(g.release_conditions||[]).map(c=>`<li>${esc(c)}</li>`).join('')||'<li class=ok>无闭锁，可发布恢复完成</li>';
+  const locks=(g.locks||[]).map(l=>`<li>${esc(l.wire_no)} @ ${esc(l.asset_code)}（${esc(l.asset_name||'')}） 班组 ${esc(l.crew)}，挂设 ${esc(l.hung_at)}，现场单号 ${esc(l.site_order_no)} — ${l.status==='active'?'<span class=locked>闭锁中</span>':`已拆除（${esc(l.removed_by)} 核对登记，${esc(l.removed_at)}）`}</li>`).join('')||'<li>无</li>';
+  const badge=g.publish_ready?'<span class=ok>可发布恢复完成</span>':'<span class=locked>送电闭锁中</span>';
+  return `<div class=incident><h3>${esc(g.incident_code)}（${esc(g.state)}） ${badge}</h3><b>闭锁线路</b><ul>${lines}</ul><b>待办步骤</b><ul>${pending}</ul><b>解除条件</b><ul>${cond}</ul><details><summary>接地线台账（${(g.locks||[]).length} 条）</summary><ul>${locks}</ul></details></div>`;
+}
+async function loadState(){
+  const data=await (await fetch('/api/state')).json();
+  state.textContent=JSON.stringify(data,null,2);
+  grounding.innerHTML=(data.grounding||[]).map(renderIncident).join('')||'<p>暂无事故</p>';
+}
+loadState()
+</script></html>

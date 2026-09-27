@@ -18,9 +18,12 @@ python3 app.py
 - `POST /api/telemetry`：记录并隔离错误遥测。
 - `POST /api/plans`、`/submit`、`/approve`、`/activate`：创建、提交、审批并启用安全恢复计划。
 - `POST /api/plans/{id}/change`：在不修改已确认步骤的前提下创建新计划版本。
-- `POST /api/field-reports`：合并现场离线报告，重复客户端编号不会重复写入。
-- `POST /api/plans/{id}/confirm`：调度员确认步骤，依赖未满足时拒绝。
-- `POST /api/status`：发布当前恢复状态。
+- `POST /api/field-reports`：合并现场离线报告，重复客户端编号不会重复写入；接地闭锁线路上的完成报告只留待处理。
+- `POST /api/plans/{id}/confirm`：调度员确认步骤，依赖未满足或步骤处于接地闭锁时拒绝。
+- `POST /api/grounding-locks`：登记接地闭锁票（线路、接地线编号、挂设时刻、班组、现场单号），同一现场单号重复上传沿用第一次结果。
+- `POST /api/grounding-locks/{id}/remove`：由另一名值班员核对线号与现场照片后登记拆除，解除后仅受影响步骤的待处理报告转入可确认。
+- `GET /api/outages/{id}/grounding`、`GET /api/grounding-locks`：按事故查看闭锁线路、待办步骤和解除条件及台账。
+- `POST /api/status`：发布当前恢复状态；事故尚有未拆除接地线时不得发布恢复完成。
 - `GET /api/plans/{id}`、`GET /api/state`、`GET /api/health`：详情、状态和健康检查。
 
 ## 测试
@@ -29,4 +32,4 @@ python3 app.py
 python3 -m unittest discover -s tests -v
 ```
 
-当前为原型：容量和依赖是静态安全模型，不包含潮流计算、SCADA/EMS 协议、实时遥测质量码或生产级多实例锁；离线合并通过客户端编号和计划版本完成。
+当前为原型：容量和依赖是静态安全模型，不包含潮流计算、SCADA/EMS 协议、实时遥测质量码或生产级多实例锁；离线合并通过客户端编号和计划版本完成。接地闭锁按资产树向下游闭锁：接地线未拆除时，闭锁线路及其下游资产上的步骤不能报完成（原报告留待处理）也不能确认；拆除须由另一名值班员核对线号和现场照片登记，解除后仅受影响步骤的待处理报告自动转入可确认；事故全部接地线登记拆除前不得发布恢复完成。首页按事故展示闭锁线路、待办步骤和解除条件。
